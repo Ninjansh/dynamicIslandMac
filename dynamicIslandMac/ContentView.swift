@@ -2,9 +2,17 @@ import SwiftUI
 import AppKit
 import Combine
 
+enum RepeatMode {
+    case off
+    case context // Repeat playlist/album
+    case track   // Repeat single track (repeat.1)
+}
+
 // MARK: - Live Media Controller
 class MediaManager: ObservableObject {
     @Published var isPlaying: Bool = false
+    @Published var isShuffling: Bool = false
+    @Published var repeatMode: RepeatMode = .off
     @Published var title: String = ""
     @Published var artist: String = ""
     @Published var position: Double = 0.0
@@ -17,9 +25,9 @@ class MediaManager: ObservableObject {
     }
 
     private var timer: AnyCancellable?
+    private var isUpdatingRepeat = false
 
     init() {
-        // Poll playback state every 0.8 seconds
         timer = Timer.publish(every: 0.8, on: .main, in: .common)
             .autoconnect()
             .sink { [weak self] _ in
@@ -29,26 +37,32 @@ class MediaManager: ObservableObject {
     }
 
     func refresh() {
-        if isRunning("com.spotify.client") {
-            fetchSpotify()
-        } else if isRunning("com.apple.Music") {
-            fetchMusic()
-        } else {
-            if activeApp != .none {
-                DispatchQueue.main.async {
-                    self.activeApp = .none
-                    self.isPlaying = false
+            let spotifyRunning = isRunning("com.spotify.client")
+            let musicRunning = isRunning("com.apple.Music")
+
+            // If Apple Music is actively playing or Spotify is closed, prioritize Music
+            if musicRunning && (!spotifyRunning || activeApp == .music) {
+                fetchMusic()
+            } else if spotifyRunning {
+                fetchSpotify()
+            } else if musicRunning {
+                fetchMusic()
+            } else {
+                if activeApp != .none {
+                    DispatchQueue.main.async {
+                        self.activeApp = .none
+                        self.isPlaying = false
+                    }
                 }
             }
         }
-    }
 
     private func isRunning(_ bundleId: String) -> Bool {
         !NSRunningApplication.runningApplications(withBundleIdentifier: bundleId).isEmpty
     }
 
-    // MARK: - Spotify
-    private func fetchSpotify() {
+    // MARK: - Spotify Polling (Respecting 3-state loop)
+    func fetchSpotify() {
         let script = """
         tell application "Spotify"
             if player state is playing or player state is paused then
@@ -58,108 +72,194 @@ class MediaManager: ObservableObject {
                 set tPos to player position
                 set tDur to (duration of current track) / 1000
                 set tArt to artwork url of current track
-                return pState & "|||" & tName & "|||" & tArtist & "|||" & tPos & "|||" & tDur & "|||" & tArt
+                set isShuf to shuffling as string
+                set isRep to repeating as string
+                return pState & "|||" & tName & "|||" & tArtist & "|||" & tPos & "|||" & tDur & "|||" & tArt & "|||" & isShuf & "|||" & isRep
             else
                 return "stopped"
             end if
         end tell
         """
         runScriptAsync(script) { [weak self] result in
-            guard let result = result, result != "stopped" else {
-                DispatchQueue.main.async { self?.activeApp = .none }
+            guard let self = self, let result = result, result != "stopped" else {
+                DispatchQueue.main.async {
+                    self?.activeApp = .none
+                    self?.isPlaying = false
+                }
                 return
             }
             let parts = result.components(separatedBy: "|||")
-            if parts.count >= 5 {
+            if parts.count >= 8 {
                 let playing = parts[0] == "playing"
                 let name = parts[1]
                 let artist = parts[2]
                 let pos = Double(parts[3]) ?? 0.0
                 let dur = Double(parts[4]) ?? 1.0
-                let artUrl = parts.count > 5 ? parts[5] : ""
+                let artUrl = parts[5]
+                let shuf = parts[6] == "true"
+                let rep = parts[7] == "true"
 
                 DispatchQueue.main.async {
-                    self?.activeApp = .spotify
-                    self?.isPlaying = playing
-                    self?.title = name
-                    self?.artist = artist
-                    self?.position = pos
-                    self?.duration = max(dur, 1.0)
-                    self?.loadRemoteArtwork(artUrl)
+                    self.activeApp = .spotify
+                    self.isPlaying = playing
+                    self.isShuffling = shuf
+
+                    if !self.isUpdatingRepeat {
+                        if !rep {
+                            self.repeatMode = .off
+                        } else if self.repeatMode == .off {
+                            self.repeatMode = .context
+                        }
+                    }
+
+                    self.title = name
+                    self.artist = artist
+                    self.position = pos
+                    self.duration = max(dur, 1.0)
+                    self.loadRemoteArtwork(artUrl)
                 }
             }
         }
     }
+
+    // MARK: - 3-Stage Repeat Toggle (Spotify Native Keystroke)
+        func cycleRepeatMode() {
+            guard activeApp == .spotify else { return }
+            isUpdatingRepeat = true
+
+            // Advance local state immediately for instant UI feedback
+            switch repeatMode {
+            case .off:
+                repeatMode = .context
+            case .context:
+                repeatMode = .track
+            case .track:
+                repeatMode = .off
+            }
+
+            // Send Spotify's native Repeat shortcut (Cmd + R)
+            // Key code 15 is 'r'
+            let script = """
+            tell application "System Events"
+                tell process "Spotify"
+                    key code 15 using {command down}
+                end tell
+            end tell
+            """
+            runCommand(script)
+
+            // Hold lock for 1.2s so the polling loop doesn't overwrite the state before Spotify updates
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+                self.isUpdatingRepeat = false
+            }
+        }
 
     private func loadRemoteArtwork(_ urlString: String) {
         guard let url = URL(string: urlString) else { return }
         URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
             if let data = data, let img = NSImage(data: data) {
-                DispatchQueue.main.async { self?.artwork = img }
+                DispatchQueue.main.async {
+                    self?.artwork = img
+                }
             }
         }.resume()
     }
 
-    // MARK: - Apple Music
-    private func fetchMusic() {
-        let script = """
-        tell application "Music"
-            if player state is playing or player state is paused then
-                set pState to (player state as string)
-                set tName to name of current track
-                set tArtist to artist of current track
-                set tPos to player position
-                set tDur to duration of current track
-                return pState & "|||" & tName & "|||" & tArtist & "|||" & tPos & "|||" & tDur
-            else
-                return "stopped"
-            end if
-        end tell
-        """
-        runScriptAsync(script) { [weak self] result in
-            guard let result = result, result != "stopped" else {
-                DispatchQueue.main.async { self?.activeApp = .none }
-                return
-            }
-            let parts = result.components(separatedBy: "|||")
-            if parts.count >= 5 {
-                let playing = parts[0] == "playing"
-                let name = parts[1]
-                let artist = parts[2]
-                let pos = Double(parts[3]) ?? 0.0
-                let dur = Double(parts[4]) ?? 1.0
+    // MARK: - Apple Music (Robust)
+        func fetchMusic() {
+            let script = """
+            tell application "Music"
+                try
+                    if player state is playing or player state is paused then
+                        set pState to (player state as string)
+                        set tName to name of current track
+                        set tArtist to artist of current track
+                        set tPos to player position
+                        set tDur to duration of current track
+                        return pState & "|||" & tName & "|||" & tArtist & "|||" & tPos & "|||" & tDur
+                    else
+                        return "stopped"
+                    end if
+                on error errStr
+                    return "error|||" & errStr
+                end try
+            end tell
+            """
+            runScriptAsync(script) { [weak self] result in
+                guard let self = self, let result = result else {
+                    return
+                }
 
-                DispatchQueue.main.async {
-                    self?.activeApp = .music
-                    self?.isPlaying = playing
-                    self?.title = name
-                    self?.artist = artist
-                    self?.position = pos
-                    self?.duration = max(dur, 1.0)
-                    self?.fetchMusicArtwork()
+                if result.starts(with: "error|||") {
+                    print("🚨 Apple Music Script Error: \(result)")
+                    return
+                }
+
+                guard result != "stopped" else {
+                    DispatchQueue.main.async {
+                        if self.activeApp == .music {
+                            self.activeApp = .none
+                            self.isPlaying = false
+                        }
+                    }
+                    return
+                }
+
+                let parts = result.components(separatedBy: "|||")
+                if parts.count >= 5 {
+                    let playing = parts[0] == "playing"
+                    let name = parts[1]
+                    let artist = parts[2]
+                    let pos = Double(parts[3]) ?? 0.0
+                    let dur = Double(parts[4]) ?? 1.0
+
+                    DispatchQueue.main.async {
+                        self.activeApp = .music
+                        self.isPlaying = playing
+                        self.title = name
+                        self.artist = artist
+                        self.position = pos
+                        self.duration = max(dur, 1.0)
+                        self.fetchMusicArtwork()
+                    }
                 }
             }
         }
-    }
 
-    private func fetchMusicArtwork() {
-        let script = """
-        tell application "Music"
-            try
-                if (count of artworks of current track) > 0 then
-                    return raw data of artwork 1 of current track
-                end if
-            end try
-            return ""
-        end tell
-        """
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            if let descriptor = self?.executeAppleScriptDescriptor(script), descriptor.data.count > 0 {
-                let img = NSImage(data: descriptor.data)
-                DispatchQueue.main.async { self?.artwork = img }
+        private func fetchMusicArtwork() {
+            let script = """
+            tell application "Music"
+                try
+                    tell current track
+                        if (count of artworks) > 0 then
+                            return raw data of artwork 1
+                        end if
+                    end tell
+                end try
+                return ""
+            end tell
+            """
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                if let descriptor = self?.executeAppleScriptDescriptor(script) {
+                    // If the AppleEvent descriptor returned valid raw image bytes (PICT, JPEG, or PNG)
+                    let data = descriptor.data
+                    if data.count > 100 {
+                        if let img = NSImage(data: data) {
+                            DispatchQueue.main.async {
+                                self?.artwork = img
+                            }
+                            return
+                        }
+                    }
+                }
+                // Fallback for cloud/streamed tracks without embedded raw bytes
+                DispatchQueue.main.async {
+                    if self?.activeApp == .music && self?.artwork == nil {
+                        self?.artwork = nil
+                    }
+                }
             }
         }
-    }
 
     // MARK: - Playback Controls
     func togglePlayPause() {
@@ -178,6 +278,23 @@ class MediaManager: ObservableObject {
         let app = activeApp == .spotify ? "Spotify" : "Music"
         runCommand("tell application \"\(app)\" to previous track")
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { self.refresh() }
+    }
+
+    func toggleShuffle() {
+        guard activeApp == .spotify else { return }
+        runCommand("tell application \"Spotify\" to set shuffling to not shuffling")
+        isShuffling.toggle()
+    }
+
+    // MARK: - Seek Track Position
+    func seek(to seconds: Double) {
+        let clampedSeconds = max(0, min(seconds, duration))
+        position = clampedSeconds
+        if activeApp == .spotify {
+            runCommand("tell application \"Spotify\" to set player position to \(clampedSeconds)")
+        } else if activeApp == .music {
+            runCommand("tell application \"Music\" to set player position to \(clampedSeconds)")
+        }
     }
 
     private func runCommand(_ script: String) {
@@ -273,7 +390,7 @@ struct DynamicIslandBorder: Shape {
 // MARK: - Animated Equalizer Visualizer
 struct iOSAudioVisualizer: View {
     var isPlaying: Bool
-    var barColor: Color = Color(red: 0.95, green: 0.35, blue: 0.45)
+    var barColor: Color = Color(red: 0.11, green: 0.84, blue: 0.38)
 
     @State private var barHeights: [CGFloat] = [0.4, 0.8, 0.5, 0.9]
     let timer = Timer.publish(every: 0.18, on: .main, in: .common).autoconnect()
@@ -300,6 +417,8 @@ struct iOSAudioVisualizer: View {
 struct ContentView: View {
     @StateObject private var media = MediaManager()
     @State private var isHovered = false
+    @State private var isScrubbing: Bool = false
+    @State private var scrubPosition: Double = 0.0
 
     private let trueBlack = Color(nsColor: NSColor(displayP3Red: 0, green: 0, blue: 0, alpha: 1.0))
     private let compactIslandWidth: CGFloat = 238
@@ -311,24 +430,23 @@ struct ContentView: View {
 
     var body: some View {
         let islandWidth: CGFloat = isHovered ? 410 : compactIslandWidth
-        let islandHeight: CGFloat = isHovered ? 175 : compactIslandHeight
+        let islandHeight: CGFloat = isHovered ? 138 : compactIslandHeight
 
         VStack(spacing: 0) {
             ZStack(alignment: .top) {
-                // Background Pure Black Bezel Shape
-                DynamicIslandShape(topCornerRadius: isHovered ? 12 : 7, bottomCornerRadius: isHovered ? 24 : 14)
-                    .fill(trueBlack)
+                if hasActiveMedia || isHovered {
+                    DynamicIslandShape(topCornerRadius: isHovered ? 12 : 7, bottomCornerRadius: isHovered ? 24 : 13)
+                        .fill(trueBlack)
 
-                // Edge stroke for contrast
-                DynamicIslandBorder(topCornerRadius: isHovered ? 12 : 7, bottomCornerRadius: isHovered ? 24 : 14)
-                    .stroke(Color.white.opacity(isHovered ? 0.15 : 0.08), lineWidth: 0.75)
+                    DynamicIslandBorder(topCornerRadius: isHovered ? 12 : 7, bottomCornerRadius: isHovered ? 24 : 13)
+                        .stroke(Color.white.opacity(isHovered ? 0.15 : 0.08), lineWidth: 0.75)
+                }
 
-                // Content Layer
                 Group {
                     if isHovered {
                         expandedMediaView
                             .transition(.opacity.combined(with: .scale(scale: 0.94, anchor: .top)))
-                    } else {
+                    } else if hasActiveMedia {
                         compactMediaView
                             .transition(.opacity)
                     }
@@ -338,7 +456,7 @@ struct ContentView: View {
             .frame(width: islandWidth, height: islandHeight)
             .contentShape(Rectangle())
             .onHover { hovering in
-                withAnimation(.spring(response: 0.36, dampingFraction: 0.72, blendDuration: 0)) {
+                withAnimation(.interpolatingSpring(mass: 0.8, stiffness: 260, damping: 19)) {
                     isHovered = hovering
                 }
             }
@@ -346,10 +464,9 @@ struct ContentView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }
 
-    // MARK: - Compact Pill (Tucked Snug to Notch Edges)
+    // MARK: - Compact Pill
     private var compactMediaView: some View {
         HStack(spacing: 0) {
-            // Album art or placeholder icon
             Group {
                 if let art = media.artwork {
                     Image(nsImage: art)
@@ -371,49 +488,47 @@ struct ContentView: View {
 
             Spacer()
 
-            // Waveform visualizer tucked tight to the right ear
             iOSAudioVisualizer(
                 isPlaying: media.isPlaying,
-                barColor: media.activeApp == .spotify ? Color.green : Color(red: 0.95, green: 0.35, blue: 0.45)
+                barColor: media.activeApp == .spotify ? Color(red: 0.11, green: 0.84, blue: 0.38) : Color(red: 0.95, green: 0.35, blue: 0.45)
             )
             .padding(.trailing, 8)
         }
         .frame(maxHeight: .infinity, alignment: .center)
     }
 
-    // MARK: - Expanded Card
+    // MARK: - Expanded Live Media Card
     private var expandedMediaView: some View {
-        VStack(spacing: 12) {
-            HStack(spacing: 12) {
-                // Album artwork
+        VStack(spacing: 8) {
+            // Artwork & Song Metadata
+            HStack(spacing: 10) {
                 Group {
                     if let art = media.artwork {
                         Image(nsImage: art)
                             .resizable()
                             .aspectRatio(contentMode: .fill)
                     } else {
-                        RoundedRectangle(cornerRadius: 11, style: .continuous)
+                        RoundedRectangle(cornerRadius: 9, style: .continuous)
                             .fill(LinearGradient(colors: [.red, .purple], startPoint: .topLeading, endPoint: .bottomTrailing))
                             .overlay(
                                 Image(systemName: "music.note")
-                                    .font(.system(size: 22, weight: .semibold))
+                                    .font(.system(size: 18, weight: .semibold))
                                     .foregroundColor(.white.opacity(0.9))
                             )
                     }
                 }
-                .frame(width: 52, height: 52)
-                .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
-                .shadow(color: Color.black.opacity(0.4), radius: 6, x: 0, y: 3)
+                .frame(width: 42, height: 42)
+                .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+                .shadow(color: Color.black.opacity(0.4), radius: 5, x: 0, y: 2)
 
-                // Track & Artist
-                VStack(alignment: .leading, spacing: 2) {
+                VStack(alignment: .leading, spacing: 1) {
                     Text(media.title.isEmpty ? "Not Playing" : media.title)
-                        .font(.system(size: 14, weight: .semibold))
+                        .font(.system(size: 13, weight: .semibold))
                         .foregroundColor(.white)
                         .lineLimit(1)
 
                     Text(media.artist.isEmpty ? "No Media App Active" : media.artist)
-                        .font(.system(size: 12))
+                        .font(.system(size: 11))
                         .foregroundColor(.gray)
                         .lineLimit(1)
                 }
@@ -422,61 +537,144 @@ struct ContentView: View {
 
                 iOSAudioVisualizer(
                     isPlaying: media.isPlaying,
-                    barColor: media.activeApp == .spotify ? Color.green : Color(red: 0.95, green: 0.35, blue: 0.45)
+                    barColor: media.activeApp == .spotify ? Color(red: 0.11, green: 0.84, blue: 0.38) : Color(red: 0.95, green: 0.35, blue: 0.45)
                 )
                 .padding(.trailing, 4)
             }
 
-            // Timeline bar
-            VStack(spacing: 5) {
+            // Interactive Scrubber & Timestamps
+            VStack(spacing: 4) {
                 GeometryReader { geo in
+                    let currentPos = isScrubbing ? scrubPosition : media.position
+                    let progress = min(max(currentPos / max(media.duration, 1.0), 0.0), 1.0)
+
                     ZStack(alignment: .leading) {
                         Capsule()
                             .fill(Color.white.opacity(0.18))
-                            .frame(height: 5)
+                            .frame(height: isScrubbing ? 6 : 4)
 
                         Capsule()
                             .fill(Color.white)
-                            .frame(
-                                width: geo.size.width * CGFloat(min(max(media.position / media.duration, 0.0), 1.0)),
-                                height: 5
-                            )
+                            .frame(width: geo.size.width * CGFloat(progress), height: isScrubbing ? 6 : 4)
+
+                        Circle()
+                            .fill(Color.white)
+                            .frame(width: isScrubbing ? 12 : 0, height: isScrubbing ? 12 : 0)
+                            .offset(x: max(0, (geo.size.width * CGFloat(progress)) - 6))
+                            .shadow(color: .black.opacity(0.3), radius: 2)
                     }
+                    .frame(maxHeight: .infinity, alignment: .center)
+                    .contentShape(Rectangle())
+                    .gesture(
+                        DragGesture(minimumDistance: 0)
+                            .onChanged { value in
+                                isScrubbing = true
+                                let clampedX = max(0, min(value.location.x, geo.size.width))
+                                let ratio = clampedX / geo.size.width
+                                scrubPosition = ratio * media.duration
+                            }
+                            .onEnded { value in
+                                let clampedX = max(0, min(value.location.x, geo.size.width))
+                                let ratio = clampedX / geo.size.width
+                                let targetTime = ratio * media.duration
+                                media.seek(to: targetTime)
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                                    isScrubbing = false
+                                }
+                            }
+                    )
                 }
-                .frame(height: 5)
+                .frame(height: 12)
 
                 HStack {
-                    Text(formatTime(media.position))
-                        .font(.system(size: 10, weight: .medium, design: .monospaced))
+                    let displayPos = isScrubbing ? scrubPosition : media.position
+                    Text(formatTime(displayPos))
+                        .font(.system(size: 9.5, weight: .medium, design: .monospaced))
                         .foregroundColor(.gray)
                     Spacer()
-                    Text("-" + formatTime(max(media.duration - media.position, 0)))
-                        .font(.system(size: 10, weight: .medium, design: .monospaced))
+                    Text("-" + formatTime(max(media.duration - displayPos, 0)))
+                        .font(.system(size: 9.5, weight: .medium, design: .monospaced))
                         .foregroundColor(.gray)
                 }
             }
 
-            // Playback controls
-            HStack(spacing: 36) {
+            // MARK: - Spotify 1:1 Transport Controls
+            HStack(spacing: 26) {
+                // Shuffle Button with Dot
+                Button(action: { media.toggleShuffle() }) {
+                    VStack(spacing: 2.5) {
+                        Image(systemName: "shuffle")
+                            .font(.system(size: 13.5, weight: .bold))
+                            .foregroundColor(media.isShuffling ? Color(red: 0.11, green: 0.84, blue: 0.38) : Color(white: 0.65))
+                            .frame(height: 16)
+
+                        Circle()
+                            .fill(Color(red: 0.11, green: 0.84, blue: 0.38))
+                            .frame(width: 3.5, height: 3.5)
+                            .opacity(media.isShuffling ? 1 : 0)
+                    }
+                    .frame(width: 28, height: 28)
+                }
+                .buttonStyle(.plain)
+
+                // Spotify Previous: Triangle pointing into a solid bar
                 Button(action: { media.previousTrack() }) {
-                    Image(systemName: "backward.fill")
-                        .font(.system(size: 18))
-                        .foregroundColor(.white)
+                    Image(systemName: "backward.end.fill")
+                        .font(.system(size: 16, weight: .medium))
+                        .foregroundColor(Color(white: 0.80))
                 }
                 .buttonStyle(.plain)
 
-                Button(action: { media.togglePlayPause() }) {
-                    Image(systemName: media.isPlaying ? "pause.fill" : "play.fill")
-                        .font(.system(size: 26))
-                        .foregroundColor(.white)
-                        .frame(width: 32, height: 32)
+                // Spotify White Circle Play/Pause Button
+                Button(action: {
+                    withAnimation(.spring(response: 0.22, dampingFraction: 0.65)) {
+                        media.togglePlayPause()
+                    }
+                }) {
+                    ZStack {
+                        Circle()
+                            .fill(Color.white)
+                            .frame(width: 34, height: 34)
+                            .shadow(color: Color.black.opacity(0.3), radius: 4, x: 0, y: 2)
+
+                        Image(systemName: media.isPlaying ? "pause.fill" : "play.fill")
+                            .font(.system(size: 14.5, weight: .black))
+                            .foregroundColor(.black)
+                            .offset(x: media.isPlaying ? 0 : 1)
+                    }
                 }
                 .buttonStyle(.plain)
 
+                // Spotify Next: Triangle pointing into a solid bar
                 Button(action: { media.nextTrack() }) {
-                    Image(systemName: "forward.fill")
-                        .font(.system(size: 18))
-                        .foregroundColor(.white)
+                    Image(systemName: "forward.end.fill")
+                        .font(.system(size: 16, weight: .medium))
+                        .foregroundColor(Color(white: 0.80))
+                }
+                .buttonStyle(.plain)
+
+                // 3-State Spotify Repeat Button (Off -> Repeat All -> Repeat 1)
+                Button(action: { media.cycleRepeatMode() }) {
+                    VStack(spacing: 2.5) {
+                        ZStack {
+                            if media.repeatMode == .track {
+                                Image(systemName: "repeat.1")
+                                    .font(.system(size: 13.5, weight: .bold))
+                                    .foregroundColor(Color(red: 0.11, green: 0.84, blue: 0.38))
+                            } else {
+                                Image(systemName: "repeat")
+                                    .font(.system(size: 13.5, weight: .bold))
+                                    .foregroundColor(media.repeatMode == .context ? Color(red: 0.11, green: 0.84, blue: 0.38) : Color(white: 0.65))
+                            }
+                        }
+                        .frame(height: 16)
+
+                        Circle()
+                            .fill(Color(red: 0.11, green: 0.84, blue: 0.38))
+                            .frame(width: 3.5, height: 3.5)
+                            .opacity(media.repeatMode != .off ? 1 : 0)
+                    }
+                    .frame(width: 28, height: 28)
                 }
                 .buttonStyle(.plain)
             }
@@ -484,8 +682,8 @@ struct ContentView: View {
             .padding(.top, 2)
         }
         .padding(.horizontal, 16)
-        .padding(.top, 14)
-        .padding(.bottom, 12)
+        .padding(.top, 8)
+        .padding(.bottom, 10)
     }
 
     private func formatTime(_ seconds: Double) -> String {
